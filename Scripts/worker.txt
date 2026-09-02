@@ -1,0 +1,15 @@
+#!/bin/bash
+
+DEST="roland@192.168.0.109:/home/roland/stereo_images/"
+SRC="/home/pi"
+
+mkdir -p "$SRC/.sent"
+
+while true; do
+  for f in $SRC/101_*.png; do
+    [ -e "$f" ] || continue
+    scp -q "$f" "$DEST" && mv "$f" "$SRC/.sent/"
+  done
+  sleep 0.2
+done
+

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER="pi"
+IPS=(192.168.0.101 192.168.0.102 192.168.0.103 192.168.0.104 192.168.0.105 192.168.0.106 192.168.0.107 192.168.0.108 192.168.0.111 192.168.0.112)
+
+REMOTE_CMD='cd /home/pi/Scripts && exec sudo ./TriggerSinglePi'
+
+mkdir -p logs
+
+declare -A SSH_PIDS
+
+cleanup() {
+  echo
+  echo "Ctrl+C detected — stopping remote processes..."
+
+  # Kill local ssh sessions (this usually propagates SIGINT)
+  for ip in "${!SSH_PIDS[@]}"; do
+    pid="${SSH_PIDS[$ip]}"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -INT "$pid" 2>/dev/null || true
+    fi
+  done
+
+  # Extra safety: explicitly kill TriggerSinglePi on each Pi
+  for ip in "${IPS[@]}"; do
+    ssh -o ConnectTimeout=3 "${USER}@${ip}" \
+      "sudo pkill -INT TriggerSinglePi" \
+      >/dev/null 2>&1 || true
+  done
+
+  echo "Shutdown signal sent to all Pis."
+  exit 130
+}
+
+trap cleanup INT TERM
+
+for ip in "${IPS[@]}"; do
+  echo "Starting on $ip..."
+
+  ssh -tt \
+    -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=accept-new \
+    "${USER}@${ip}" "${REMOTE_CMD}" \
+    </dev/null \
+    >"logs/${ip}.out" 2>"logs/${ip}.err" &
+
+  SSH_PIDS["$ip"]=$!
+done
+
+sleep 3
+
+echo
+echo "ENTER -> capture"
+echo "q     -> quit"
+
+while true; do
+  IFS= read -r line || break
+  case "$line" in
+    q|Q) break ;;
+    *) echo -n "TRIGGER" | socat - UDP-DATAGRAM:192.168.0.255:5005,broadcast ;;
+  esac
+done
+
+cleanup

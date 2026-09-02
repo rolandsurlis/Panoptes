@@ -1,0 +1,150 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/wait.h>
+#include <sched.h>
+
+#define GPIO_PIN "3"          // GPIO3 (pin 5)
+#define GPIO_PATH "/sys/class/gpio/gpio3/value"
+
+#define UDP_PORT 5005
+#define TRIGGER_MSG "TRIGGER"
+
+#define DEBOUNCE_MS 300       
+#define BUF_SIZE 64
+
+static pid_t rasp_pid = -1;
+static uint64_t last_trigger_ms = 0;
+
+/* ---------- timing ---------- */
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+/* ---------- scheduling ---------- */
+static void set_rr_scheduler(void) {
+    struct sched_param param;
+    param.sched_priority = 1;
+    pthread_setschedparam(pthread_self(), SCHED_RR, &param);
+}
+
+/* ---------- raspistill ---------- */
+static void start_raspistill(void) {
+    rasp_pid = fork();
+    if (rasp_pid == 0) {
+        execlp("raspistill",
+               "raspistill",
+               "-s",
+               "-3d", "sbs",
+               "-w", "8112",
+               "-h", "3040",
+               "-vf", "-hf",
+               "-o", "/home/pi/101_%03d.png",
+               NULL);
+        perror("execlp");
+        exit(1);
+    }
+    fprintf(stderr, "Started raspistill PID %d\n", rasp_pid);
+}
+
+/* ---------- trigger ---------- */
+static void trigger_capture(void) {
+    uint64_t t = now_ms();
+    if (t - last_trigger_ms < DEBOUNCE_MS)
+        return;   // debounce 
+
+    last_trigger_ms = t;
+    kill(rasp_pid, SIGUSR1);
+}
+
+/* ---------- GPIO setup ---------- */
+static int setup_gpio(void) {
+    system("echo 3 > /sys/class/gpio/export 2>/dev/null");
+    system("raspi-gpio set 3 pu");
+    system("echo in > /sys/class/gpio/gpio3/direction");
+    system("echo falling > /sys/class/gpio/gpio3/edge");
+
+    int fd = open(GPIO_PATH, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        perror("open gpio");
+        return -1;
+    }
+
+    // clear any pending edge
+    char buf;
+    read(fd, &buf, 1);
+    return fd;
+}
+
+/* ---------- UDP setup ---------- */
+static int setup_udp(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(UDP_PORT),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind udp");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* ---------- main ---------- */
+int main(void) {
+    set_rr_scheduler();
+    start_raspistill();
+
+    int gpio_fd = setup_gpio();
+    int udp_fd  = setup_udp();
+    if (gpio_fd < 0 || udp_fd < 0)
+        return 1;
+
+    struct pollfd fds[2] = {
+        { gpio_fd, POLLPRI, 0 },
+        { udp_fd,  POLLIN,  0 }
+    };
+
+    fprintf(stderr, "Listening for GPIO + UDP triggers\n");
+
+    while (1) {
+        if (poll(fds, 2, -1) < 0)
+            continue;
+
+        /* GPIO trigger */
+        if (fds[0].revents & POLLPRI) {
+            lseek(gpio_fd, 0, SEEK_SET);
+            char buf;
+            read(gpio_fd, &buf, 1);
+            fprintf(stderr, "GPIO trigger\n");
+            trigger_capture();
+        }
+
+        /* UDP trigger */
+        if (fds[1].revents & POLLIN) {
+            char buf[BUF_SIZE];
+            recv(udp_fd, buf, sizeof(buf), 0);
+            if (strncmp(buf, TRIGGER_MSG, 7) == 0) {
+                fprintf(stderr, "UDP trigger\n");
+                trigger_capture();
+            }
+        }
+    }
+}
+
